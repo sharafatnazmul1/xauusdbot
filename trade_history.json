@@ -1,0 +1,22 @@
+[
+  {
+    "timestamp": "2025-11-17T19:40:03.664168",
+    "ticket": 664304721,
+    "direction": "SELL",
+    "volume": 0.01,
+    "entry": 4070.065,
+    "sl": 4076.077,
+    "tp": 4057.702,
+    "score": 72.47,
+    "quality": "STRONG",
+    "session": "ny",
+    "risk_reward": 2.0,
+    "components": {
+      "level_break": 51.2,
+      "body_strength": 100.0,
+      "volume_spike": 80.0,
+      "trend_align": 100.0,
+      "compression": 50.0
+    }
+  }
+]

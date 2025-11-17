@@ -1,0 +1,21 @@
+{
+  "symbol": "XAUUSDm",
+  "magic_number": 888888,
+  "max_spread_points": 162,
+  "max_positions": 2,
+  "risk_percent": 5.0,
+  "min_lot": 0.01,
+  "max_lot": 1.0,
+  "max_daily_loss_percent": 100.0,
+  "max_consecutive_losses": 3,
+  "max_daily_trades": 14,
+  "signal_cooldown_minutes": 20,
+  "use_breakeven": true,
+  "breakeven_trigger_rr": 1.0,
+  "use_partial_tp": true,
+  "min_score": 45.0,
+  "strong_score": 60.0,
+  "check_interval_seconds": 15,
+  "trading_start_hour": 1,
+  "trading_end_hour": 23
+}

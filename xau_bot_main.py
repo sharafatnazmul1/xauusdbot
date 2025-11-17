@@ -32,10 +32,22 @@ class XAUTradingBot:
         self.max_daily_trades = self.config.get("max_daily_trades", 14)
         self.signal_cooldown_minutes = self.config.get("signal_cooldown_minutes", 20)
         
-        # Trade management
+        # Trade management - Enhanced Profit Protection
         self.use_breakeven = self.config.get("use_breakeven", True)
         self.breakeven_trigger_rr = self.config.get("breakeven_trigger_rr", 1.0)  # Move to BE at 1:1
-        self.use_partial_tp = self.config.get("use_partial_tp", True)  # Disabled by default - simpler
+        self.use_partial_tp = self.config.get("use_partial_tp", True)  # Close 50% at 1.5:1 R:R
+        self.use_trailing_stop = self.config.get("use_trailing_stop", True)  # ATR-based trailing
+        self.trailing_atr_multiplier = self.config.get("trailing_atr_multiplier", 0.5)  # Trail distance
+
+        # Profit locking levels (R:R ratios)
+        self.profit_lock_levels = self.config.get("profit_lock_levels", {
+            "level_1": 1.0,   # Lock 20% of profit at 1:1
+            "level_2": 1.5,   # Lock 50% of profit at 1.5:1 (also partial TP)
+            "level_3": 2.0    # Lock 70% of profit at 2:1 (full TP area)
+        })
+
+        # Track which profit levels have been activated per position
+        self.profit_levels_activated = {}  # {ticket: {'level_1': True, 'level_2': False, ...}}
         
         # State tracking
         self.daily_pnl = 0.0
@@ -73,9 +85,17 @@ class XAUTradingBot:
             "max_consecutive_losses": 3,
             "max_daily_trades": 8,
             "signal_cooldown_minutes": 20,
+            # Enhanced profit protection settings
             "use_breakeven": True,
             "breakeven_trigger_rr": 1.0,
-            "use_partial_tp": False,
+            "use_partial_tp": True,  # Enable partial TP by default
+            "use_trailing_stop": True,  # Enable trailing stop
+            "trailing_atr_multiplier": 0.5,  # Trail at 0.5x ATR distance
+            "profit_lock_levels": {
+                "level_1": 1.0,   # Lock 20% profit at 1:1 R:R
+                "level_2": 1.5,   # Lock 50% profit at 1.5:1 R:R
+                "level_3": 2.0    # Lock 70% profit at 2:1 R:R
+            },
             "min_score": 45.0,
             "strong_score": 60.0,
             "check_interval_seconds": 15,
@@ -384,47 +404,221 @@ class XAUTradingBot:
         with open(history_file, 'w') as f:
             json.dump(history, f, indent=2)
 
-    def manage_breakeven(self, position):
-        """Move SL to breakeven when profit reaches trigger"""
-        if not self.use_breakeven:
-            return
-        
+    def manage_profit_protection(self, position):
+        """
+        Enhanced profit protection system for XAU/USD:
+        - Multi-level profit locking at 1:1, 1.5:1, 2:1 R:R
+        - ATR-based trailing stop loss
+        - Partial profit taking at 1.5:1
+        - Smart profit preservation
+        """
+        ticket = position.ticket
+
+        # Get current price
         tick = mt5.symbol_info_tick(self.symbol)
         if tick is None:
             return
-        
+
+        # Initialize tracking for this position if needed
+        if ticket not in self.profit_levels_activated:
+            self.profit_levels_activated[ticket] = {
+                'level_1': False,
+                'level_2': False,
+                'level_3': False,
+                'trailing_active': False
+            }
+
         open_price = position.price_open
         current_sl = position.sl
         tp = position.tp
-        
-        # Calculate original SL distance
-        if position.type == mt5.ORDER_TYPE_BUY:
+        is_buy = position.type == mt5.ORDER_TYPE_BUY
+
+        # Calculate original SL distance (risk)
+        if is_buy:
             original_sl_distance = open_price - current_sl
             current_price = tick.bid
             current_profit_distance = current_price - open_price
-            
-            # Check if we should move to breakeven
-            # Trigger when profit >= SL distance * trigger_rr
-            trigger_distance = original_sl_distance * self.breakeven_trigger_rr
-            
-            if current_profit_distance >= trigger_distance and current_sl < open_price:
-                # Move SL to entry + small buffer
-                buffer = self.symbol_info.point * 10  # 10 points buffer
-                new_sl = open_price + buffer
-                self.modify_position_sl(position.ticket, new_sl)
-                self.logger.info(f" Breakeven set: Ticket {position.ticket}")
         else:
             original_sl_distance = current_sl - open_price
             current_price = tick.ask
             current_profit_distance = open_price - current_price
-            
-            trigger_distance = original_sl_distance * self.breakeven_trigger_rr
-            
-            if current_profit_distance >= trigger_distance and current_sl > open_price:
-                buffer = self.symbol_info.point * 10
-                new_sl = open_price - buffer
-                self.modify_position_sl(position.ticket, new_sl)
-                self.logger.info(f" Breakeven set: Ticket {position.ticket}")
+
+        # Safety check
+        if original_sl_distance <= 0:
+            return
+
+        # Calculate current R:R ratio
+        current_rr = current_profit_distance / original_sl_distance
+
+        # Get current ATR for trailing calculations
+        atr = self.get_current_atr()
+        if atr is None:
+            atr = original_sl_distance  # Fallback to original SL distance
+
+        # ----- MULTI-LEVEL PROFIT LOCKING -----
+
+        # Level 1: Lock 20% of profit at 1:1 R:R (Smart Breakeven)
+        if (current_rr >= self.profit_lock_levels['level_1'] and
+            not self.profit_levels_activated[ticket]['level_1']):
+
+            # Lock 20% of original risk as profit
+            profit_lock = original_sl_distance * 0.20
+
+            if is_buy:
+                new_sl = open_price + profit_lock
+                if new_sl > current_sl:  # Only move forward
+                    self.modify_position_sl(ticket, new_sl)
+                    self.logger.info(f"✓ Level 1 (1:1): Locked 20% profit | Ticket: {ticket}")
+                    self.profit_levels_activated[ticket]['level_1'] = True
+            else:
+                new_sl = open_price - profit_lock
+                if new_sl < current_sl:  # Only move forward
+                    self.modify_position_sl(ticket, new_sl)
+                    self.logger.info(f"✓ Level 1 (1:1): Locked 20% profit | Ticket: {ticket}")
+                    self.profit_levels_activated[ticket]['level_1'] = True
+
+        # Level 2: Lock 50% of profit at 1.5:1 R:R + Partial TP
+        elif (current_rr >= self.profit_lock_levels['level_2'] and
+              not self.profit_levels_activated[ticket]['level_2']):
+
+            # Lock 50% of original risk as profit
+            profit_lock = original_sl_distance * 0.50
+
+            if is_buy:
+                new_sl = open_price + profit_lock
+                if new_sl > current_sl:
+                    self.modify_position_sl(ticket, new_sl)
+                    self.logger.info(f"✓✓ Level 2 (1.5:1): Locked 50% profit | Ticket: {ticket}")
+                    self.profit_levels_activated[ticket]['level_2'] = True
+
+                    # Partial profit taking - close 50% of position
+                    if self.use_partial_tp and ticket not in self.partial_closed_tickets:
+                        self.close_partial_position(position, 0.5)
+            else:
+                new_sl = open_price - profit_lock
+                if new_sl < current_sl:
+                    self.modify_position_sl(ticket, new_sl)
+                    self.logger.info(f"✓✓ Level 2 (1.5:1): Locked 50% profit | Ticket: {ticket}")
+                    self.profit_levels_activated[ticket]['level_2'] = True
+
+                    if self.use_partial_tp and ticket not in self.partial_closed_tickets:
+                        self.close_partial_position(position, 0.5)
+
+        # Level 3: Lock 70% of profit at 2:1 R:R (near full TP)
+        elif (current_rr >= self.profit_lock_levels['level_3'] and
+              not self.profit_levels_activated[ticket]['level_3']):
+
+            # Lock 70% of original risk as profit
+            profit_lock = original_sl_distance * 0.70
+
+            if is_buy:
+                new_sl = open_price + profit_lock
+                if new_sl > current_sl:
+                    self.modify_position_sl(ticket, new_sl)
+                    self.logger.info(f"✓✓✓ Level 3 (2:1): Locked 70% profit | Ticket: {ticket}")
+                    self.profit_levels_activated[ticket]['level_3'] = True
+            else:
+                new_sl = open_price - profit_lock
+                if new_sl < current_sl:
+                    self.modify_position_sl(ticket, new_sl)
+                    self.logger.info(f"✓✓✓ Level 3 (2:1): Locked 70% profit | Ticket: {ticket}")
+                    self.profit_levels_activated[ticket]['level_3'] = True
+
+        # ----- ATR-BASED TRAILING STOP -----
+
+        # Activate trailing after Level 1 is hit
+        if (self.use_trailing_stop and
+            self.profit_levels_activated[ticket]['level_1'] and
+            current_rr >= self.profit_lock_levels['level_1']):
+
+            # Trailing distance based on ATR
+            trailing_distance = atr * self.trailing_atr_multiplier
+
+            # Calculate what the trailing SL should be
+            if is_buy:
+                trailing_sl = current_price - trailing_distance
+
+                # Only move SL forward, never backward
+                if trailing_sl > current_sl:
+                    self.modify_position_sl(ticket, trailing_sl)
+
+                    # Log only first activation or significant moves
+                    if not self.profit_levels_activated[ticket]['trailing_active']:
+                        self.logger.info(f"⚡ Trailing Stop Activated | Ticket: {ticket} | Distance: {trailing_distance:.2f}")
+                        self.profit_levels_activated[ticket]['trailing_active'] = True
+            else:
+                trailing_sl = current_price + trailing_distance
+
+                if trailing_sl < current_sl:
+                    self.modify_position_sl(ticket, trailing_sl)
+
+                    if not self.profit_levels_activated[ticket]['trailing_active']:
+                        self.logger.info(f"⚡ Trailing Stop Activated | Ticket: {ticket} | Distance: {trailing_distance:.2f}")
+                        self.profit_levels_activated[ticket]['trailing_active'] = True
+
+    def get_current_atr(self) -> Optional[float]:
+        """Get current ATR value for trailing stop calculations"""
+        try:
+            df = self.signal_gen.get_market_data(bars=50)
+            if df is None or len(df) < 14:
+                return None
+
+            atr_values = self.signal_gen.calculate_atr(df)
+            current_atr = float(atr_values.iloc[-1])
+            return current_atr
+        except Exception as e:
+            self.logger.debug(f"ATR calculation error: {e}")
+            return None
+
+    def close_partial_position(self, position, fraction: float = 0.5):
+        """
+        Close a fraction of the position for partial profit taking
+
+        Args:
+            position: MT5 position object
+            fraction: Fraction to close (0.5 = 50%)
+        """
+        if position.ticket in self.partial_closed_tickets:
+            return  # Already partially closed
+
+        close_volume = round(position.volume * fraction, 2)
+
+        # Make sure we have valid volume
+        if close_volume < self.symbol_info.volume_min:
+            self.logger.debug(f"Partial close volume too small: {close_volume}")
+            return
+
+        # Determine close price and order type
+        if position.type == mt5.ORDER_TYPE_BUY:
+            close_type = mt5.ORDER_TYPE_SELL
+            close_price = mt5.symbol_info_tick(self.symbol).bid
+        else:
+            close_type = mt5.ORDER_TYPE_BUY
+            close_price = mt5.symbol_info_tick(self.symbol).ask
+
+        # Prepare partial close request
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "volume": close_volume,
+            "type": close_type,
+            "position": position.ticket,
+            "price": close_price,
+            "deviation": 30,
+            "magic": self.magic_number,
+            "comment": "Partial TP 50%",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        # Execute partial close
+        result = mt5.order_send(request)
+
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            self.partial_closed_tickets.add(position.ticket)
+            self.logger.info(f"💰 Partial TP: Closed {fraction*100:.0f}% at 1.5:1 | Ticket: {position.ticket}")
+        else:
+            self.logger.warning(f"Partial close failed: {result.comment if result else 'Unknown error'}")
 
     def modify_position_sl(self, ticket: int, new_sl: float):
         """Modify stop loss of a position"""
@@ -470,11 +664,21 @@ class XAUTradingBot:
                     self.logger.info(f"Trade closed with profit: ${profit:.2f}")
 
     def manage_positions(self):
-        """Manage all open positions"""
+        """Manage all open positions with enhanced profit protection"""
         positions = self.get_open_positions()
-        
+
         for pos in positions:
-            self.manage_breakeven(pos)
+            self.manage_profit_protection(pos)
+
+        # Clean up tracking for closed positions
+        if positions:
+            open_tickets = {p.ticket for p in positions}
+            closed_tickets = set(self.profit_levels_activated.keys()) - open_tickets
+
+            for ticket in closed_tickets:
+                del self.profit_levels_activated[ticket]
+                if ticket in self.partial_closed_tickets:
+                    self.partial_closed_tickets.remove(ticket)
 
     def run_cycle(self):
         """Single iteration of the bot logic"""
